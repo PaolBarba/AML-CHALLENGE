@@ -4,9 +4,11 @@ import hmac
 import hashlib
 import io
 import json
+import logging
 import math
 import re
 import sqlite3
+import tempfile
 import threading
 import time
 import warnings
@@ -122,6 +124,13 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.executescript('''
           PRAGMA journal_mode=WAL;
+          CREATE TABLE IF NOT EXISTS reference_access (
+            team TEXT PRIMARY KEY, started REAL NOT NULL);
+          CREATE TABLE IF NOT EXISTS reference_batches (
+            id TEXT PRIMARY KEY, team TEXT NOT NULL, window_end REAL NOT NULL,
+            source_hash TEXT NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL,
+            created REAL NOT NULL, received REAL, edited BLOB,
+            UNIQUE(team, window_end, source_hash));
           CREATE TABLE IF NOT EXISTS shared_images (
             id TEXT PRIMARY KEY, filename TEXT NOT NULL, created REAL NOT NULL,
             expires REAL NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL,
@@ -156,6 +165,32 @@ class Store:
         if not existing:
             self.db.execute('INSERT INTO benchmark VALUES(?)', (fingerprint.hexdigest(),))
         self.db.commit()
+        self.refresh_excel()
+
+    def export_excel(self):
+        from .excel import workbook_bytes
+        # shortcut: one local server owns the workbook; use a single export worker if scaling to multiple processes.
+        with self.lock:
+            raw = workbook_bytes(self)
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(dir=self.root, suffix='.xlsx', delete=False) as output:
+                    temporary = Path(output.name)
+                    output.write(raw)
+                temporary.replace(self.root / 'results.xlsx')
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+            return raw
+
+    def refresh_excel(self):
+        try:
+            self.export_excel()
+            return True
+        except Exception:
+            # The submission is already committed; an export failure must not invite duplicate retries.
+            logging.exception('Excel refresh failed; records are safe in SQLite. Retry the organizer export.')
+            return False
 
     def path(self, relative):
         path = (self.root / relative).resolve()
@@ -163,11 +198,58 @@ class Store:
             raise Invalid('Dataset path escapes data directory')
         return path
 
+    def reference_window(self, team):
+        now = time.time()
+        with self.lock, self.db:
+            self.db.execute('INSERT OR IGNORE INTO reference_access VALUES(?,?)', (team, now))
+            started = self.db.execute('SELECT started FROM reference_access WHERE team=?', (team,)).fetchone()[0]
+        elapsed = max(0, now - started)
+        phase = elapsed % 60
+        available = phase >= 30
+        remaining = (60 if available else 30) - phase
+        return dict(available=available, server_time=now, seconds_remaining=remaining,
+                    next_change_at=now + remaining, wait_seconds=30, available_seconds=30,
+                    image_url='/api/reference/image')
+
     def load(self, task, field, mode):
         with Image.open(self.path(task[field])) as image:
             if image.mode != mode:
                 raise Invalid(f'{field} must have mode {mode}')
             return image.copy()
+
+    def issue_reference_batch(self, team, raw, width, height, window_end):
+        digest = hashlib.sha256(raw).hexdigest()
+        with self.lock, self.db:
+            existing = self.db.execute('SELECT id FROM reference_batches WHERE team=? AND window_end=? AND source_hash=?',
+                                       (team, window_end, digest)).fetchone()
+            if existing:
+                return existing['id']
+            count = self.db.execute('SELECT COUNT(*) FROM reference_batches WHERE team=?', (team,)).fetchone()[0]
+            if count >= self.config.get('max_team_submissions', 1000):
+                raise Invalid('Reference batch limit reached')
+            batch_id = uuid.uuid4().hex
+            self.db.execute('INSERT INTO reference_batches (id,team,window_end,source_hash,width,height,created) VALUES(?,?,?,?,?,?,?)',
+                            (batch_id, team, window_end, digest, width, height, time.time()))
+        return batch_id
+
+    def submit_reference(self, payload, team, admin=False):
+        if admin or team not in self.config['teams']:
+            raise PermissionError('Use a team token to submit a reference edit')
+        batch_id = payload.get('batch_id')
+        if not isinstance(batch_id, str) or not ID.fullmatch(batch_id):
+            raise Invalid('Provide the batch_id from GET /api/reference/json')
+        with self.lock:
+            batch = self.db.execute('SELECT * FROM reference_batches WHERE id=? AND team=?', (batch_id, team)).fetchone()
+        if batch is None:
+            raise PermissionError('Batch was not issued to this team')
+        edited = image_bytes(decode_image(payload.get('edited_image'), 'RGB', (batch['width'], batch['height'])))
+        with self.lock, self.db:
+            cursor = self.db.execute('UPDATE reference_batches SET received=?, edited=? WHERE id=? AND received IS NULL',
+                                     (time.time(), edited, batch_id))
+            if cursor.rowcount != 1:
+                raise Invalid('An edit was already accepted for this batch')
+        return dict(status='accepted', batch_id=batch_id, reference_id='backpack_reference',
+                    scoring_status='unconfigured', excel_updated=self.refresh_excel())
 
     def authenticate(self, token):
         if hmac.compare_digest(token, self.config['admin_token']):
@@ -280,7 +362,8 @@ class Store:
             except sqlite3.IntegrityError as exc:
                 raise Invalid('This task already exists in the run; use a new run_id') from exc
         result = {'submission_id': cursor.lastrowid, 'status': 'accepted',
-                  'ranking_mode': 'measured' if measured else 'quality_only'}
+                  'ranking_mode': 'measured' if measured else 'quality_only',
+                  'excel_updated': self.refresh_excel()}
         if task['split'] != 'test' or admin:
             result['metrics'] = metrics
         return result
@@ -321,11 +404,14 @@ class Store:
             if existing:
                 if measured:
                     self.db.execute("UPDATE runs SET mode='measured' WHERE team=? AND run=? AND split=?", (team, run, split))
-                return
-            count = self.db.execute('SELECT COUNT(*) FROM runs WHERE team=?', (team,)).fetchone()[0]
-            if count >= self.config.get('max_runs_per_team', 100):
-                raise Invalid('Team run limit reached')
-            self.db.execute('INSERT INTO runs VALUES(?,?,?,?,?)', (team, run, split, 'measured' if measured else 'quality', time.time()))
+                else:
+                    return
+            else:
+                count = self.db.execute('SELECT COUNT(*) FROM runs WHERE team=?', (team,)).fetchone()[0]
+                if count >= self.config.get('max_runs_per_team', 100):
+                    raise Invalid('Team run limit reached')
+                self.db.execute('INSERT INTO runs VALUES(?,?,?,?,?)', (team, run, split, 'measured' if measured else 'quality', time.time()))
+        self.refresh_excel()
 
     def select(self, team, split, run):
         if split not in ('train', 'validation', 'test') or not isinstance(run, str) or not ID.fullmatch(run):
@@ -334,6 +420,7 @@ class Store:
             if not self.db.execute('SELECT 1 FROM runs WHERE team=? AND split=? AND run=?', (team, split, run)).fetchone():
                 raise Invalid('Unknown run in this split')
             self.db.execute('INSERT OR REPLACE INTO selections VALUES(?,?,?)', (team, split, run))
+        self.refresh_excel()
 
     def leaderboard(self, split, measured=False):
         tasks = {k: t for k, t in self.tasks.items() if t['split'] == split}

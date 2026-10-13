@@ -1,0 +1,6 @@
+.venv/
+.challenge/
+__pycache__/
+*.py[cod]
+backups/
+.env

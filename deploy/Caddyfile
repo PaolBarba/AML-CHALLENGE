@@ -1,0 +1,17 @@
+{
+	admin off
+	servers {
+		timeouts {
+			read_header 10s
+			read_body 60s
+			idle 2m
+		}
+	}
+}
+
+{$CHALLENGE_DOMAIN} {
+	request_body {
+		max_size 33554432
+	}
+	reverse_proxy app:8000
+}

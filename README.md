@@ -4,6 +4,8 @@ A local challenge platform for the [Advanced Machine Learning challenge](CHALLEN
 
 ## Run it
 
+For a hosted deployment, see [DEPLOYMENT.md](DEPLOYMENT.md).
+
 Python 3.11 or newer is required. This workspace already has `.venv` with the core dependencies installed.
 
 ```bash
@@ -18,6 +20,107 @@ Open **http://127.0.0.1:8000**. Enter the `team_demo` token from `.challenge/con
 `init-demo` refuses to overwrite an existing configuration. If the demo is already initialized, run only `serve`. Use `--data /path/to/dataset` before the subcommand for another dataset.
 
 The bundled dataset has six synthetic color-edit tasks across training, validation, and test. It exercises the complete submission workflow; it is not a realistic image-editing benchmark or a trained DINOv2 editor.
+
+## FastAPI reference server
+
+An alternative API entry point for the backpack download/upload workflow is `challenge/api.py`:
+
+```bash
+.venv/bin/pip install -r requirements-api.txt
+.venv/bin/python -m uvicorn challenge.api:app --host 127.0.0.1 --port 8000
+```
+
+Stop the original server before starting this alternative. Use one process per dataset, without multiple workers. It uses the existing `.challenge/config.json` team tokens and SQLite records, preserves timers and batches, and refreshes Excel after uploads. Set `CHALLENGE_DATA=/path/to/dataset` to select another dataset. The dataset must already be initialized.
+
+The FastAPI app has only two application endpoints: **GET `/api/reference/json`** to load the image and its batch ID, and **POST `/api/reference/submissions`** to upload the edited image for that batch. Both use the team token. The download returns HTTP 423 with the countdown during the wait; retry the same endpoint when it opens. Excel continues to update locally at `.challenge/results.xlsx`.
+
+Open **http://127.0.0.1:8000/docs**, click **Authorize**, enter your team token, and use **Try it out**. Upload JSON contains `batch_id` and the base64 `edited_image`. Existing curl requests for these two endpoints work unchanged. Config, separate timer/image routes, health, and Excel download routes are not exposed by this FastAPI app.
+
+This entry point provides the reference workflow and interactive API docs; use `challenge.server` for the full scored-task dashboard. Do not name a local file `fastapi.py`, because it shadows the installed package. Run its in-process HTTP tests with `.venv/bin/python -m unittest discover -s tests -p test_api.py -v`. The test lifecycle follows the [FastAPI testing documentation](https://fastapi.tiangolo.com/advanced/testing-events/).
+
+## Give students access
+
+Create one token per team (or use an individual student ID for individual work):
+
+```bash
+.venv/bin/python -m challenge.server add-team team_01
+.venv/bin/python -m challenge.server add-team team_02
+```
+
+Run provisioning commands one at a time, then restart the server. For another dataset, put `--data /path/to/dataset` before `add-team`. The command prints the newly generated token and saves it in the private dataset `config.json` with owner-only permissions. An existing team is rejected without changing its token or results. `.env` only configures the deployment hostname.
+
+Privately give each team its token and server URL. Students can paste the token into the dashboard's connection form, or use it in an API request:
+
+```bash
+export CHALLENGE_TOKEN='TOKEN_GIVEN_BY_THE_INSTRUCTOR'
+curl --fail 'http://127.0.0.1:8000/api/tasks?split=validation' \
+  -H "Authorization: Bearer $CHALLENGE_TOKEN"
+```
+
+Students on another computer must use the reachable server URL instead of `127.0.0.1`. A team token permits access to all public task records and source images, submissions under that team's identity, and its own submission artifacts. It does not grant organizer access or access to private test masks. Tokens do not currently expire or restrict a team to an individual task. Never distribute the organizer token or the full configuration file.
+
+## Timed backpack reference
+
+The dashboard serves `data/image.png` through a token-protected reference panel. Each team's first access check starts a repeating cycle: **30 seconds locked, then 30 seconds available**. A countdown and **Load reference image** button show the current window. The preview disappears when access closes. Reloading the page, opening another tab with the same token, or restarting the server does not reset the cycle; its start time is stored in SQLite.
+
+- `GET /api/reference`: returns `available`, `seconds_remaining`, `server_time`, `next_change_at`, and `image_url`.
+- `GET /api/reference/image`: returns the sample PNG during the open window, or HTTP **423** with timing information during the wait.
+- `GET /api/reference/json`: returns the image as a base64 `image` string together with `reference_id`, `filename`, `content_type`, `encoding`, `image_width`, `image_height`, and the timing fields in one JSON response. The same token and availability rules apply; locked responses contain no image.
+- All reference endpoints require `Authorization: Bearer TOKEN`. Responses use `Cache-Control: no-store`. Organizers follow the same timing rule.
+
+```bash
+curl --fail 'http://127.0.0.1:8000/api/reference' \
+  -H "Authorization: Bearer $CHALLENGE_TOKEN"
+# During the available window:
+curl --fail 'http://127.0.0.1:8000/api/reference/image' \
+  -H "Authorization: Bearer $CHALLENGE_TOKEN" -o reference.png
+```
+
+The timer controls new downloads and the dashboard preview; it cannot revoke saved copies. This sample is a viewing reference, not a scored task: it still needs editing instructions, a private reference mask, and an appropriate evaluation rubric before submissions can be scored against it. Existing scored tasks and temporary image uploads keep their own availability rules.
+
+To retrieve the complete reference JSON during an open window:
+
+```bash
+curl --fail 'http://127.0.0.1:8000/api/reference/json' \
+  -H "Authorization: Bearer $CHALLENGE_TOKEN" -o reference.json
+```
+
+Decode the downloaded image using Python:
+
+```python
+import base64
+import json
+from pathlib import Path
+
+reference = json.loads(Path('reference.json').read_text())
+Path('reference.png').write_bytes(base64.b64decode(reference['image']))
+```
+
+HTTP 401 means the token is missing or invalid. HTTP 423 means wait for `seconds_remaining` and retry. The JSON bundle contains the viewing reference and timing metadata; it does not expose the private `config.json` or organizer-side `tasks.json`. Public scored-task instructions are available separately at `GET /api/tasks?split=validation`.
+
+### Upload an edit of the downloaded reference batch
+
+Download a fresh `reference.json` using `GET /api/reference/json`; it now includes a server-issued `batch_id` bound to your team and reference window. Older downloads without `batch_id` must be downloaded again. Repeated downloads within the same window return the same batch ID; the next available window issues a new batch.
+
+After editing the image, send an RGB PNG at the original resolution using the **same team token**:
+
+```python
+import base64
+import json
+from pathlib import Path
+from challenge.client import Client
+
+reference = json.loads(Path('reference.json').read_text())
+result = Client('http://127.0.0.1:8000').request('/api/reference/submissions', {
+    'batch_id': reference['batch_id'],
+    'edited_image': base64.b64encode(Path('edited.png').read_bytes()).decode('ascii'),
+})
+print(result)
+```
+
+Set `CHALLENGE_TOKEN` before running this code. The API accepts one edit per issued batch and rejects unknown batches, another team's batches, wrong dimensions, invalid images, and repeated uploads. Uploads can arrive after the download window closes. An issued batch establishes ownership and source identity; it cannot prove how a student generated an edit.
+
+Accepted edits persist in SQLite and appear in the **Reference uploads** worksheet in `results.xlsx`. The response is HTTP 201 with `status: accepted` and `scoring_status: unconfigured`. These uploads do not receive benchmark scores until the reference has editing instructions and evaluation annotations. The existing scored-task submission API remains separate.
 
 ## Complete a student run
 
@@ -196,6 +299,49 @@ for image in client.request('/api/images'):
 
 Images and expiry timestamps persist in SQLite. Expired rows are removed when the image API is used. Active temporary storage is limited to 100 images and 256 MiB; decoded images retain the existing 16-million-pixel limit. Source uploads accept single-frame RGB PNG/JPEG, while predicted masks and edited submissions still require PNG. No new dependencies are needed.
 
+## Local image APIs and Excel results
+
+1. Start the local server with `.venv/bin/python -m challenge.server serve`.
+2. A team lists `GET /api/tasks?split=validation`, then downloads each task's `image_url`.
+3. The team sends `POST /api/submissions` with the task ID, edited RGB PNG, grayscale localization mask, and run ID. Images are base64 strings in JSON.
+4. The server evaluates the submission and saves its metrics. It automatically refreshes `.challenge/results.xlsx` (or `results.xlsx` in your `--data` directory).
+
+Example participant code, with `CHALLENGE_TOKEN` set to the team's token:
+
+```python
+import base64
+from pathlib import Path
+from challenge.client import Client
+
+client = Client('http://127.0.0.1:8000')
+task = client.request('/api/tasks?split=validation')[0]
+Path('source.png').write_bytes(client.request(task['image_url'], binary=True))
+# Run your model using source.png, task['source_prompt'], and task['target_prompt'].
+# Write edited.png (RGB) and mask.png (grayscale), both at source resolution.
+result = client.request('/api/submissions', {
+    'task_id': task['task_id'],
+    'edited_image': base64.b64encode(Path('edited.png').read_bytes()).decode(),
+    'predicted_mask': base64.b64encode(Path('mask.png').read_bytes()).decode(),
+    'metadata': {'run_id': 'experiment_001', 'model_name': 'my_editor'},
+})
+print(result)
+```
+
+The workbook has **Team rankings** (selected runs, all splits, quality and measured modes) and **Submissions** (every accepted result and metric). It includes IoU, Dice, precision, recall, boundary F1, localization success thresholds, background MAE, preservation, edit success, efficiency when measured, composite score, and any enabled representation diagnostics. Scores use the existing challenge rules; unavailable metrics remain blank. Incomplete runs retain missing-task penalties in the rankings.
+
+SQLite remains the authoritative database. Excel is an automatically regenerated results snapshot; manual workbook edits are overwritten. Run one server per data directory. Updates occur on server startup, run registration, submissions, and run selection. If a workbook write fails, the submission remains accepted in SQLite and its response includes `excel_updated: false`; the server logs the failure. Close a locked workbook and retry the organizer export to rebuild it.
+
+With an organizer token, download a fresh workbook using the dashboard's **Download Excel results** button or `GET /api/results.xlsx`. This endpoint includes all teams and private test metrics, so team tokens receive HTTP 403. For example, with `CHALLENGE_TOKEN` set to the organizer token:
+
+```python
+from pathlib import Path
+from challenge.client import Client
+
+Path('team-results.xlsx').write_bytes(
+    Client('http://127.0.0.1:8000').request('/api/results.xlsx', binary=True)
+)
+```
+
 ## API
 
 All `/api/` routes require `Authorization: Bearer TOKEN`. The dashboard shell is public. POST requests require `Content-Type: application/json`; request bodies are bounded to 32 MB, decoded source/output images to 16 million pixels, and metadata to 16 KB. PNG dimensions and modes must match exactly. Non-finite timing values are rejected.
@@ -206,6 +352,7 @@ All `/api/` routes require `Authorization: Bearer TOKEN`. The dashboard shell is
 | GET | `/api/images` | List unexpired temporary images |
 | GET | `/api/images/{image_id}` | Download within the five-minute availability window |
 | GET | `/api/config` | Public configuration and authenticated identity |
+| GET | `/api/results.xlsx` | Organizer-only Excel export of team rankings and submission metrics |
 | GET | `/api/tasks?split=validation` | Public task records; no private rubric or annotation paths |
 | GET | `/api/tasks/{task_id}/image` | Source PNG |
 | GET | `/api/tasks/{task_id}/mask` | Public reference mask; test requires organizer token |

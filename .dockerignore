@@ -1,0 +1,8 @@
+**
+!requirements.txt
+!challenge/
+!challenge/*.py
+!static/
+!static/**
+!data/
+!data/image.png

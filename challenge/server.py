@@ -1,4 +1,6 @@
 import argparse
+import base64
+import io
 import json
 import logging
 import socket
@@ -8,10 +10,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from PIL import Image
+
 from .demo import initialize
 from .store import Invalid, Store
 
 STATIC = Path(__file__).resolve().parent.parent / 'static'
+REFERENCE = STATIC.parent / 'data' / 'image.png'
 MAX_BODY = 32 * 1024 * 1024
 
 
@@ -111,9 +116,10 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
-        if not post and path in ('/', '/app.js', '/style.css'):
+        if not post and path in ('/', '/app.js', '/reference.js', '/style.css'):
             filename, mime = {'/': ('index.html', 'text/html; charset=utf-8'),
                               '/app.js': ('app.js', 'text/javascript; charset=utf-8'),
+                              '/reference.js': ('reference.js', 'text/javascript; charset=utf-8'),
                               '/style.css': ('style.css', 'text/css; charset=utf-8')}[path]
             self.reply(200, (STATIC / filename).read_bytes(), mime)
             return
@@ -152,6 +158,9 @@ class Handler(BaseHTTPRequestHandler):
             if path in ('/api/submissions', '/api/measured-submissions'):
                 self.reply(201, store.submit(payload, team, admin, path.endswith('measured-submissions')))
                 return
+            if path == '/api/reference/submissions':
+                self.reply(201, store.submit_reference(payload, team, admin))
+                return
             if path == '/api/runs':
                 selected_team = payload.get('student_id', team) if admin else team
                 measured = payload.get('mode', 'quality') == 'measured'
@@ -168,8 +177,33 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, {'status': 'selected'})
                 return
             raise KeyError()
+        if path in ('/api/reference', '/api/reference/image', '/api/reference/json'):
+            window = store.reference_window(team)
+            if path == '/api/reference':
+                self.reply(200, window)
+            elif not window['available']:
+                self.reply(423, dict(window, error='Reference image is locked until the next window'))
+            elif path == '/api/reference/json':
+                raw = REFERENCE.read_bytes()
+                with Image.open(io.BytesIO(raw)) as image:
+                    width, height = image.size
+                batch_id = store.issue_reference_batch(team, raw, width, height, window['next_change_at'])
+                self.reply(200, dict(window, reference_id='backpack_reference', filename='image.png',
+                                     batch_id=batch_id,
+                                     content_type='image/png', encoding='base64',
+                                     image_width=width, image_height=height,
+                                     image=base64.b64encode(raw).decode('ascii')))
+            else:
+                self.reply(200, REFERENCE.read_bytes(), 'image/png')
+            return
         if path == '/api/images':
             self.reply(200, store.shared_images())
+            return
+        if path == '/api/results.xlsx':
+            if not admin:
+                raise PermissionError('Only organizers can export all team results')
+            self.reply(200, store.export_excel(),
+                       'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
             return
         parts = path.strip('/').split('/')
         if len(parts) == 3 and parts[:2] == ['api', 'images']:
@@ -225,6 +259,8 @@ def main():
     parser.add_argument('--data', default='.challenge')
     sub = parser.add_subparsers(dest='action', required=True)
     sub.add_parser('init-demo', help='Generate synthetic fixture and local credentials')
+    team = sub.add_parser('add-team', help='Create a team token; restart the server afterward')
+    team.add_argument('team_id')
     serve = sub.add_parser('serve')
     serve.add_argument('--host', default='127.0.0.1')
     serve.add_argument('--port', type=int, default=8000)
@@ -232,6 +268,13 @@ def main():
     if args.action == 'init-demo':
         initialize(args.data)
         print(f'Demo initialized. Credentials: {Path(args.data).resolve() / "config.json"}')
+    elif args.action == 'add-team':
+        from .credentials import add_team
+        try:
+            token = add_team(args.data, args.team_id)
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
+        print(f'Team: {args.team_id}\nToken: {token}\nShare this token privately with the team. Restart the server to enable it.')
     else:
         logging.basicConfig(level=logging.INFO)
         server = Server((args.host, args.port), Store(args.data))

@@ -11,9 +11,11 @@ from urllib.request import Request, urlopen
 
 import numpy as np
 from PIL import Image
+from openpyxl import load_workbook
 
 from challenge.baseline import edit, infer
 from challenge.demo import initialize
+from challenge.credentials import add_team
 from challenge.metrics import evaluate, localization, score
 from challenge.runner import collect, execute
 from challenge.server import Server
@@ -42,6 +44,213 @@ class Fixture(unittest.TestCase):
         metadata['run_id'] = run
         return dict(task_id=task_id, student_id='team_demo', edited_image=encoded(source if unchanged else edited),
                     predicted_mask=encoded(mask), metadata=metadata)
+
+
+class ReferenceTests(Fixture):
+    def test_edited_upload_is_bound_to_team_batch_and_persists(self):
+        raw = image_bytes(Image.new('RGB', (16, 12), 'blue'))
+        batch_id = self.store.issue_reference_batch('team_demo', raw, 16, 12, 1060)
+        self.assertEqual(batch_id, self.store.issue_reference_batch('team_demo', raw, 16, 12, 1060))
+        payload = dict(batch_id=batch_id, edited_image=encoded(Image.new('RGB', (16, 12), 'red')))
+        self.store.config['teams']['other_team'] = 'x' * 32
+        for team, admin in (('other_team', False), ('admin', True)):
+            with self.assertRaises(PermissionError):
+                self.store.submit_reference(payload, team, admin)
+        with self.assertRaises(PermissionError):
+            self.store.submit_reference(dict(payload, batch_id='unknown'), 'team_demo')
+        for image in (Image.new('RGB', (8, 8)), Image.new('L', (16, 12))):
+            with self.assertRaises(Invalid):
+                self.store.submit_reference(dict(payload, edited_image=encoded(image)), 'team_demo')
+        other = Store(self.root)
+        try:
+            result = other.submit_reference(payload, 'team_demo')
+            self.assertEqual(result['status'], 'accepted')
+            self.assertEqual(result['scoring_status'], 'unconfigured')
+            self.assertTrue(result['excel_updated'])
+            with self.assertRaises(Invalid):
+                other.submit_reference(payload, 'team_demo')
+            row = other.db.execute('SELECT edited FROM reference_batches WHERE id=?', (batch_id,)).fetchone()
+            self.assertEqual(row['edited'], image_bytes(Image.new('RGB', (16, 12), 'red')))
+            book = load_workbook(self.root / 'results.xlsx')
+            try:
+                self.assertEqual(book['Reference uploads']['A2'].value, batch_id)
+                self.assertEqual(book['Reference uploads']['B2'].value, 'team_demo')
+            finally:
+                book.close()
+        finally:
+            other.db.close()
+
+    def test_json_download_then_upload_route(self):
+        from challenge.server import Handler
+        handler = Handler.__new__(Handler)
+        handler.server = Mock(store=self.store)
+        handler.reply = Mock()
+        handler.path = '/api/reference/json'
+        handler.headers = {'Authorization': 'Bearer ' + self.config['teams']['team_demo']}
+        with patch('challenge.store.time.time', return_value=1000):
+            handler.route(False)
+        with patch('challenge.store.time.time', return_value=1030):
+            handler.route(False)
+        downloaded = handler.reply.call_args.args[1]
+        payload = json.dumps({'batch_id': downloaded['batch_id'], 'edited_image': downloaded['image']}).encode()
+        handler.headers.update({'Content-Type': 'application/json', 'Content-Length': str(len(payload))})
+        handler.rfile = io.BytesIO(payload)
+        handler.path = '/api/reference/submissions'
+        handler.route(True)
+        self.assertEqual(handler.reply.call_args.args[0], 201)
+        self.assertEqual(handler.reply.call_args.args[1]['batch_id'], downloaded['batch_id'])
+
+    def test_json_bundle_auth_timing_image_and_private_data(self):
+        from challenge.server import Handler, REFERENCE
+        handler = Handler.__new__(Handler)
+        handler.server = Mock(store=self.store)
+        handler.reply = Mock()
+        handler.path = '/api/reference/json'
+        for headers in ({}, {'Authorization': 'Bearer invalid'}):
+            handler.headers = headers
+            handler.route(False)
+            self.assertEqual(handler.reply.call_args.args[0], 401)
+        handler.headers = {'Authorization': 'Bearer ' + self.config['teams']['team_demo']}
+        for now, status in ((1000, 423), (1030, 200), (1060, 423)):
+            with patch('challenge.store.time.time', return_value=now):
+                handler.route(False)
+            code, payload = handler.reply.call_args.args
+            self.assertEqual(code, status)
+            if status == 423:
+                self.assertNotIn('image', payload)
+                continue
+            decoded = base64.b64decode(payload['image'], validate=True)
+            self.assertEqual(decoded, REFERENCE.read_bytes())
+            with Image.open(io.BytesIO(decoded)) as image:
+                self.assertEqual(image.size, (payload['image_width'], payload['image_height']))
+            public = json.dumps(payload)
+            for secret in (self.config['admin_token'], *self.config['teams'].values()):
+                self.assertNotIn(secret, public)
+            self.assertNotIn('ground_truth_mask', payload)
+
+    def test_boundaries_repeat_and_restart_does_not_reset_wait(self):
+        for now, available, remaining in ((1000, False, 30), (1029, False, 1),
+                                          (1030, True, 30), (1059, True, 1),
+                                          (1060, False, 30), (1090, True, 30)):
+            with patch('challenge.store.time.time', return_value=now):
+                window = self.store.reference_window('team_demo')
+            self.assertEqual(window['available'], available)
+            self.assertEqual(window['seconds_remaining'], remaining)
+        other = Store(self.root)
+        try:
+            with patch('challenge.store.time.time', return_value=1095):
+                self.assertEqual(other.reference_window('team_demo')['seconds_remaining'], 25)
+                self.assertFalse(other.reference_window('another_team')['available'])
+        finally:
+            other.db.close()
+
+    def test_reference_routes_require_token_and_enforce_window(self):
+        from challenge.server import Handler, REFERENCE
+        handler = Handler.__new__(Handler)
+        handler.server = Mock(store=self.store)
+        handler.reply = Mock()
+        handler.path = '/api/reference/image'
+        handler.headers = {}
+        handler.route(False)
+        self.assertEqual(handler.reply.call_args.args[0], 401)
+        handler.headers = {'Authorization': 'Bearer wrong'}
+        handler.route(False)
+        self.assertEqual(handler.reply.call_args.args[0], 401)
+        handler.headers = {'Authorization': 'Bearer ' + self.config['teams']['team_demo']}
+        with patch('challenge.store.time.time', return_value=1000):
+            handler.route(False)
+            self.assertEqual(handler.reply.call_args.args[0], 423)
+            handler.path = '/api/reference'
+            handler.route(False)
+            self.assertEqual(handler.reply.call_args.args[1]['seconds_remaining'], 30)
+        handler.path = '/api/reference/image'
+        with patch('challenge.store.time.time', return_value=1030):
+            handler.route(False)
+            self.assertEqual(handler.reply.call_args.args, (200, REFERENCE.read_bytes(), 'image/png'))
+        with patch('challenge.store.time.time', return_value=1060):
+            handler.route(False)
+            self.assertEqual(handler.reply.call_args.args[0], 423)
+        handler.path = '/data/image.png'
+        with self.assertRaises(KeyError):
+            handler.route(False)
+
+
+class CredentialTests(Fixture):
+    def test_issue_unique_tokens_and_preserve_configuration(self):
+        first = add_team(self.root, 'team_01')
+        second = add_team(self.root, 'team_02')
+        self.assertNotEqual(first, second)
+        self.assertGreaterEqual(len(first), 24)
+        path = self.root / 'config.json'
+        config = json.loads(path.read_text())
+        self.assertEqual(config['admin_token'], self.config['admin_token'])
+        self.assertEqual(config['teams']['team_demo'], self.config['teams']['team_demo'])
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        before = path.read_bytes()
+        for team in ('team_01', '../bad', '', 'a' * 81):
+            with self.assertRaises(ValueError):
+                add_team(self.root, team)
+        self.assertEqual(path.read_bytes(), before)
+        reloaded = Store(self.root)
+        try:
+            self.assertEqual(reloaded.authenticate(first), ('team_01', False))
+            self.assertEqual(reloaded.authenticate(second), ('team_02', False))
+            self.assertEqual(reloaded.authenticate('invalid-token'), (None, False))
+        finally:
+            reloaded.db.close()
+
+
+class ExcelTests(Fixture):
+    def rows(self, name):
+        book = load_workbook(self.root / 'results.xlsx')
+        try:
+            values = list(book[name].values)
+            return [dict(zip(values[0], row)) for row in values[1:]]
+        finally:
+            book.close()
+
+    def test_metrics_rankings_selection_and_restart(self):
+        result = self.store.submit(self.payload(), 'team_demo')
+        self.assertTrue(result['excel_updated'])
+        record = self.rows('Submissions')[0]
+        self.assertEqual(record['Team'], 'team_demo')
+        self.assertEqual(record['score'], 1)
+        self.assertEqual(record['dice'], 1)
+        self.assertIsNone(record['efficiency'])
+        quality = next(r for r in self.rows('Team rankings') if r['Mode'] == 'quality')
+        self.assertEqual(quality['Score'], .5)  # One of two tasks is missing.
+        self.store.submit(self.payload(run='worse', unchanged=True), 'team_demo')
+        self.store.select('team_demo', 'validation', 'run_1')
+        self.assertEqual(self.rows('Team rankings')[0]['Selected run'], 'run_1')
+        (self.root / 'results.xlsx').unlink()
+        other = Store(self.root)
+        other.db.close()
+        self.assertEqual(len(self.rows('Submissions')), 2)
+
+    def test_export_failure_preserves_records_and_previous_workbook(self):
+        before = (self.root / 'results.xlsx').read_bytes()
+        with patch('challenge.store.Path.replace', side_effect=PermissionError('Workbook locked')):
+            with self.assertLogs(level='ERROR'):
+                result = self.store.submit(self.payload(), 'team_demo')
+        self.assertEqual(result['status'], 'accepted')
+        self.assertFalse(result['excel_updated'])
+        self.assertEqual(len(self.store.submissions('team_demo')), 1)
+        self.assertEqual((self.root / 'results.xlsx').read_bytes(), before)
+        self.assertEqual(list(self.root.glob('*.xlsx')), [self.root / 'results.xlsx'])
+        self.store.export_excel()
+        self.assertEqual(len(self.rows('Submissions')), 1)
+
+    def test_formula_like_text_is_literal_and_null_scores_stay_blank(self):
+        self.store.tasks['validation_001']['task_type'] = '=1+1'
+        self.store.tasks['validation_001'].pop('edit_rubric')
+        self.store.submit(self.payload(), 'team_demo')
+        book = load_workbook(self.root / 'results.xlsx')
+        try:
+            self.assertEqual(book['Submissions']['F2'].value, '=1+1')
+            self.assertEqual(book['Submissions']['F2'].data_type, 's')
+            self.assertIsNone(self.rows('Submissions')[0]['score'])
+        finally:
+            book.close()
 
 
 class SharedImageTests(Fixture):
@@ -309,6 +518,23 @@ class HTTPTests(Fixture):
         with self.request('/api/tasks?split=validation') as response:
             self.assertEqual(len(json.load(response)), 2)
 
+    def test_new_team_token_accesses_tasks_but_not_private_masks(self):
+        token = add_team(self.root, 'team_01')
+        reloaded = Store(self.root)
+        self.server.store = reloaded
+        try:
+            headers = {'Authorization': 'Bearer ' + token}
+            with urlopen(Request(self.url + '/api/tasks?split=validation', headers=headers)) as response:
+                task = json.load(response)[0]
+            with urlopen(Request(self.url + task['image_url'], headers=headers)) as response:
+                self.assertTrue(response.read().startswith(b'\x89PNG'))
+            with self.assertRaises(HTTPError) as error:
+                urlopen(Request(self.url + '/api/tasks/test_001/mask', headers=headers))
+            self.assertEqual(error.exception.code, 403)
+        finally:
+            self.server.store = self.store
+            reloaded.db.close()
+
     def test_private_test_mask_and_no_arbitrary_files(self):
         for path, code in (('/api/tasks/test_001/mask', 403), ('/config.json', 404), ('/.challenge/config.json', 404)):
             with self.assertRaises(HTTPError) as error:
@@ -326,6 +552,23 @@ class HTTPTests(Fixture):
             self.assertEqual(len(json.load(response)), 1)
         with self.request('/api/submissions/' + str(result['submission_id']) + '/edited') as response:
             self.assertTrue(response.read().startswith(b'\x89PNG'))
+
+    def test_excel_download_is_organizer_only_and_current(self):
+        for token, status in ((False, 401), (True, 403)):
+            with self.assertRaises(HTTPError) as error:
+                self.request('/api/results.xlsx', token=token)
+            self.assertEqual(error.exception.code, status)
+        with self.request('/api/submissions', self.payload(task_id='test_001')) as response:
+            self.assertNotIn('metrics', json.load(response))
+        with self.request('/api/results.xlsx', admin=True) as response:
+            self.assertEqual(response.headers['Content-Type'],
+                             'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+            book = load_workbook(io.BytesIO(response.read()))
+        try:
+            self.assertEqual(book['Submissions'].max_row, 2)
+            self.assertEqual(book['Submissions']['D2'].value, 'test_001')
+        finally:
+            book.close()
 
     def test_nonfinite_json_is_rejected_and_admin_token_not_exposed(self):
         payload = self.payload()
