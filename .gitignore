@@ -12,3 +12,5 @@ backups/
 .challenge-reference-clip/
 
 .challenge-uploads/
+
+PIE-Bench/*
