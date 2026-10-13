@@ -1,0 +1,4 @@
+-r requirements.txt
+# Optional diagnostics only; install in an environment with suitable CPU/CUDA wheels.
+torch==2.9.0
+transformers==4.57.1
