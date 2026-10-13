@@ -4,3 +4,11 @@ __pycache__/
 *.py[cod]
 backups/
 .env
+
+.challenge-reference/
+
+.challenge-reference-v2/
+
+.challenge-reference-clip/
+
+.challenge-uploads/

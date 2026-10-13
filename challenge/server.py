@@ -177,6 +177,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, {'status': 'selected'})
                 return
             raise KeyError()
+        if path == '/api/reference/leaderboard':
+            self.reply(200, store.reference_leaderboard())
+            return
         if path in ('/api/reference', '/api/reference/image', '/api/reference/json'):
             window = store.reference_window(team)
             if path == '/api/reference':
@@ -184,7 +187,7 @@ class Handler(BaseHTTPRequestHandler):
             elif not window['available']:
                 self.reply(423, dict(window, error='Reference image is locked until the next window'))
             elif path == '/api/reference/json':
-                raw = REFERENCE.read_bytes()
+                raw = store.reference_image_path().read_bytes()
                 with Image.open(io.BytesIO(raw)) as image:
                     width, height = image.size
                 batch_id = store.issue_reference_batch(team, raw, width, height, window['next_change_at'])
@@ -192,9 +195,9 @@ class Handler(BaseHTTPRequestHandler):
                                      batch_id=batch_id,
                                      content_type='image/png', encoding='base64',
                                      image_width=width, image_height=height,
-                                     image=base64.b64encode(raw).decode('ascii')))
+                                     image=base64.b64encode(raw).decode('ascii'), **store.reference_instructions()))
             else:
-                self.reply(200, REFERENCE.read_bytes(), 'image/png')
+                self.reply(200, store.reference_image_path().read_bytes(), 'image/png')
             return
         if path == '/api/images':
             self.reply(200, store.shared_images())
@@ -240,8 +243,8 @@ class Handler(BaseHTTPRequestHandler):
             if kind == 'image':
                 field = 'source_image'
             elif kind == 'mask':
-                if task['split'] == 'test' and not admin:
-                    raise PermissionError('Test annotations are private')
+                if (task['split'] == 'test' or task is store.reference_task) and not admin:
+                    raise PermissionError('Reference and test annotations are private')
                 field = 'ground_truth_mask'
             else:
                 raise KeyError()

@@ -13,7 +13,7 @@ from PIL import Image
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from .server import MAX_BODY, REFERENCE
+from .server import MAX_BODY
 from .store import Invalid, Store
 
 
@@ -68,13 +68,17 @@ def create_app(data='.challenge'):
         window['image_url'] = '/api/reference/json'
         if not window['available']:
             return JSONResponse(dict(window, error='Reference image is locked until the next window'), status_code=423)
-        raw = REFERENCE.read_bytes()
+        raw = store.reference_image_path().read_bytes()
         with Image.open(io.BytesIO(raw)) as image:
             width, height = image.size
         batch_id = store.issue_reference_batch(who[0], raw, width, height, window['next_change_at'])
         return dict(window, batch_id=batch_id, reference_id='backpack_reference', filename='image.png',
                     content_type='image/png', encoding='base64', image_width=width, image_height=height,
-                    image=base64.b64encode(raw).decode('ascii'))
+                    image=base64.b64encode(raw).decode('ascii'), **store.reference_instructions())
+
+    @app.get('/api/reference/leaderboard')
+    def reference_leaderboard(request: Request, who=Depends(identity)):
+        return request.app.state.store.reference_leaderboard()
 
     @app.post('/api/reference/submissions', status_code=201, openapi_extra={
         'requestBody': {'required': True, 'content': {'application/json': {'schema': ReferenceSubmission.model_json_schema()}}}

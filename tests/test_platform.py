@@ -65,7 +65,7 @@ class ReferenceTests(Fixture):
         try:
             result = other.submit_reference(payload, 'team_demo')
             self.assertEqual(result['status'], 'accepted')
-            self.assertEqual(result['scoring_status'], 'unconfigured')
+            self.assertEqual(result['scoring_status'], 'pending')
             self.assertTrue(result['excel_updated'])
             with self.assertRaises(Invalid):
                 other.submit_reference(payload, 'team_demo')
@@ -73,8 +73,8 @@ class ReferenceTests(Fixture):
             self.assertEqual(row['edited'], image_bytes(Image.new('RGB', (16, 12), 'red')))
             book = load_workbook(self.root / 'results.xlsx')
             try:
-                self.assertEqual(book['Reference uploads']['A2'].value, batch_id)
-                self.assertEqual(book['Reference uploads']['B2'].value, 'team_demo')
+                self.assertEqual(book['Reference uploads']['B2'].value, batch_id)
+                self.assertEqual(book['Reference uploads']['A2'].value, 'team_demo')
             finally:
                 book.close()
         finally:

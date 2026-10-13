@@ -1,5 +1,6 @@
 import base64
 import io
+import json
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -49,7 +50,7 @@ class FastAPITests(unittest.TestCase):
         self.assertEqual(self.client.post('/api/reference/submissions', headers=self.headers, json=payload).status_code, 400)
         book = load_workbook(Path(self.tmp.name) / 'results.xlsx')
         try:
-            self.assertEqual(book['Reference uploads']['A2'].value, batch['batch_id'])
+            self.assertEqual(book['Reference uploads']['B2'].value, batch['batch_id'])
         finally:
             book.close()
 
@@ -69,6 +70,30 @@ class FastAPITests(unittest.TestCase):
         self.assertEqual(self.client.get('/docs').status_code, 200)
         schema = self.client.get('/openapi.json').json()
         self.assertIn('requestBody', schema['paths']['/api/reference/submissions']['post'])
-        self.assertEqual(set(schema['paths']), {'/api/reference/json', '/api/reference/submissions'})
+        self.assertEqual(set(schema['paths']), {'/api/reference/json', '/api/reference/submissions', '/api/reference/leaderboard'})
         for endpoint in ('/', '/health', '/api/config', '/api/reference', '/api/reference/image', '/api/results.xlsx'):
             self.assertEqual(self.client.get(endpoint, headers=self.headers).status_code, 404)
+
+    def test_upload_does_not_load_or_run_evaluator(self):
+        with patch('challenge.reference_metrics.ReferenceMetrics', side_effect=AssertionError('API loaded evaluator')):
+            with patch('challenge.store.time.time', return_value=1000):
+                self.client.get('/api/reference/json', headers=self.headers)
+            with patch('challenge.store.time.time', return_value=1030):
+                batch = self.client.get('/api/reference/json', headers=self.headers).json()
+            result = self.client.post('/api/reference/submissions', headers=self.headers,
+                                     json={'batch_id': batch['batch_id'], 'edited_image': batch['image']})
+            self.assertEqual(result.status_code, 201, result.text)
+            self.assertEqual(result.json()['scoring_status'], 'pending')
+            self.assertIsNone(result.json()['metrics'])
+            self.assertEqual(self.client.get('/api/reference/leaderboard', headers=self.headers).json(), [])
+            with TestClient(create_app(self.tmp.name)):
+                pass
+
+    def test_database_uses_shared_filesystem_journal(self):
+        self.assertEqual(self.client.app.state.store.db.execute('PRAGMA journal_mode').fetchone()[0], 'delete')
+
+    def test_missing_config_explains_initialization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, 'challenge.reference_demo'):
+                with TestClient(create_app(directory)):
+                    pass

@@ -50,6 +50,13 @@ class RepresentationTests(unittest.TestCase):
         self.assertEqual(result['clip_directional_similarity'], 0.)
         self.assertTrue(-1 <= result['clip_target_alignment'] <= 1)
 
+    def test_mask_free_reference_metrics(self):
+        source = Image.new('RGB', (256, 192), (210, 45, 55))
+        result = self.evaluator.evaluate_reference(source, source, 'red')
+        self.assertAlmostEqual(result['structure_distance'], 0., places=6)
+        self.assertTrue(-1 <= result['clip_similarity'] <= 1)
+        self.assertNotIn('clip_similarity', self.evaluator.evaluate_reference(source, source, ''))
+
     def test_no_background_patches_and_no_descriptions(self):
         source = Image.new('RGB', (256, 192), (120, 130, 140))
         result = self.evaluator.evaluate(source, source, Image.new('L', source.size, 255), {})

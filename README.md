@@ -32,11 +32,253 @@ An alternative API entry point for the backpack download/upload workflow is `cha
 
 Stop the original server before starting this alternative. Use one process per dataset, without multiple workers. It uses the existing `.challenge/config.json` team tokens and SQLite records, preserves timers and batches, and refreshes Excel after uploads. Set `CHALLENGE_DATA=/path/to/dataset` to select another dataset. The dataset must already be initialized.
 
-The FastAPI app has only two application endpoints: **GET `/api/reference/json`** to load the image and its batch ID, and **POST `/api/reference/submissions`** to upload the edited image for that batch. Both use the team token. The download returns HTTP 423 with the countdown during the wait; retry the same endpoint when it opens. Excel continues to update locally at `.challenge/results.xlsx`.
+The FastAPI reference workflow uses **GET `/api/reference/json`** to load the image and its batch ID, and **POST `/api/reference/submissions`** to upload the edited image for that batch. Both use the team token. Authenticated `GET /api/reference/leaderboard` returns the best scored batch per team. The download returns HTTP 423 with the countdown during the wait; retry the same endpoint when it opens. Excel continues to update locally at `.challenge/results.xlsx`.
 
 Open **http://127.0.0.1:8000/docs**, click **Authorize**, enter your team token, and use **Try it out**. Upload JSON contains `batch_id` and the base64 `edited_image`. Existing curl requests for these two endpoints work unchanged. Config, separate timer/image routes, health, and Excel download routes are not exposed by this FastAPI app.
 
 This entry point provides the reference workflow and interactive API docs; use `challenge.server` for the full scored-task dashboard. Do not name a local file `fastapi.py`, because it shadows the installed package. Run its in-process HTTP tests with `.venv/bin/python -m unittest discover -s tests -p test_api.py -v`. The test lifecycle follows the [FastAPI testing documentation](https://fastapi.tiangolo.com/advanced/testing-events/).
+
+## Student reference download
+
+With the API running, open another terminal in the repository root:
+
+```bash
+export CHALLENGE_TOKEN='YOUR_TEAM_TOKEN'
+python3 -m challenge.download_reference
+```
+
+The script waits through HTTP 423 locked windows, then saves `source.png` and
+`reference.json` (including the `batch_id` needed for submission) inside
+`reference-download/`. Press Ctrl+C to cancel waiting. Existing output folders
+are never overwritten. For a remote server or another download:
+
+```bash
+python3 -m challenge.download_reference --url https://challenge.example.org --output download-2
+```
+
+Only the Python standard library is needed for this download command. Keep your
+token private and retain `reference.json` alongside the downloaded image.
+
+## Student edited-image upload
+
+Save your edit as an RGB PNG with the same dimensions as `source.png`, then use
+its saved batch and the same team token to submit:
+
+```bash
+export CHALLENGE_TOKEN='YOUR_TEAM_TOKEN'
+python3 -m challenge.upload_reference edited.png --url http://127.0.0.1:8000
+```
+
+For another download folder, add `--reference download-2/reference.json`.
+Set `--url` to the same server used for downloading. The upload script defaults
+to `http://127.0.0.2:8000`, matching the current download script. Direct execution
+also works: `python3 challenge/upload_reference.py edited.png --url http://127.0.0.1:8000`.
+The server validates the image and batch ownership; the command prints its JSON
+response, including `status: accepted` on success.
+
+## Mask-free reference evaluation
+
+Reference uploads now use PSNR, LPIPS, MSE, SSIM, CLIP similarity, and DINO
+structure distance. Students upload only the edited RGB PNG and its batch ID.
+No predicted or organizer mask is used for these reference metrics.
+
+Install the API dependencies in your Python 3.11+ environment and create a new
+mask-free demo (previous datasets and submissions are retained):
+
+```bash
+python3 -m pip install -r requirements-api.txt
+python3 -m challenge.reference_demo
+CHALLENGE_DATA=.challenge-reference-v2 python3 -m uvicorn challenge.api:app --host 127.0.0.1 --port 8000
+```
+
+Stop the old API process first. Retrieve the new team token privately from
+`.challenge-reference-v2/config.json`. Download a fresh batch to a new folder,
+make your edit, then submit and inspect the leaderboard:
+
+```bash
+export CHALLENGE_TOKEN='NEW_TEAM_TOKEN'
+python3 -m challenge.download_reference --url http://127.0.0.1:8000 --output backpack-download-v2
+python3 -m challenge.upload_reference edited.png --reference backpack-download-v2/reference.json --url http://127.0.0.1:8000
+curl -sS http://127.0.0.1:8000/api/reference/leaderboard -H "Authorization: Bearer $CHALLENGE_TOKEN"
+```
+
+The download includes the instruction “Change the blue backpack fabric to red,
+preserving the straps and background.” Edited images must have the original
+image dimensions. SQLite retains the source used for each batch, accepted edit,
+and metrics. `.challenge-reference-v2/results.xlsx` refreshes on every acceptance
+and contains **Reference uploads** and **Reference leaderboard**.
+
+The API validates and saves uploads without loading reference models or computing
+metrics. Accepted uploads return `scoring_status: pending` and `metrics: null`.
+Run the separate evaluation command below to write scores, refresh Excel, and
+update the leaderboard. Workbook failures return `excel_updated: false` without
+losing the upload.
+
+| Field | Definition | Better |
+| --- | --- | --- |
+| `mse` | Mean squared RGB error with pixel values normalized to [0, 1] | Lower |
+| `psnr` | `10 * log10(1 / mse)`, in dB | Higher |
+| `ssim` | Mean RGB structural similarity, data range 1, up to 7x7 windows | Higher |
+| `lpips` | Pretrained AlexNet LPIPS v0.1 perceptual distance | Lower |
+| `clip_similarity` | Cosine of edited-image and target-prompt CLIP embeddings | Higher |
+| `structure_distance` | Mean squared difference between DINOv2 patch self-similarity matrices | Lower |
+
+**Preservation is evaluated over the whole image.** Without an edit-region
+annotation, the evaluator cannot distinguish intended changes from unintended
+changes. It does not report these values as measurements of only unedited
+regions. CLIP alignment is a proxy, not proof that every part of an instruction
+was satisfied; these metrics do not directly measure aesthetics or naturalness.
+
+Identical images have infinite PSNR: JSON represents it as `psnr: null` with
+`psnr_infinite: true`, while Excel displays `Infinity`. SSIM is null for images
+smaller than 3 pixels along either axis. LPIPS uses the complete frame resized
+so each dimension is between 64 and 512 pixels (aspect ratio is preserved unless
+a short dimension needs resizing to 64). DINOv2 uses the existing
+224x224 full-frame patch extractor, without center cropping. Define
+`S = normalize(patch_features) @ normalize(patch_features).T`; structure distance
+is `mean((S_original - S_edited)^2)`.
+
+The leaderboard uses each team's best batch. It sorts by CLIP similarity
+(descending), then SSIM (descending), LPIPS, structure distance, and MSE
+(ascending), then acceptance time and deterministic identifiers. Missing tie
+metrics sort last. The API's `score` field aliases raw CLIP similarity; the six
+raw metrics are retained separately, without combining incompatible scales.
+The reference leaderboard is separate from the dashboard's task/run leaderboard.
+
+### Missing dataset configuration
+
+If `.challenge/config.json` is missing, restore the original dataset from backup
+or initialize a fresh directory. Initialization creates new team tokens; it does
+not recover previous uploads. Preserve the remaining files in `.challenge`.
+
+```bash
+python3 -m challenge.reference_demo --data .challenge-uploads
+CHALLENGE_DATA=.challenge-uploads python3 -m uvicorn challenge.api:app --host 127.0.0.1 --port 8000
+```
+
+Use the token from `.challenge-uploads/config.json` and download a new batch.
+Then evaluate with `--data .challenge-uploads`, matching the API data directory.
+`CHALLENGE_EVALUATION_CONFIG` is no longer used by the API.
+
+### Evaluate with Slurm
+
+Stop the API before submitting (SQLite uses rollback journals for shared-filesystem
+access across Slurm nodes), activate your Python 3.11+ environment containing the dependencies
+in `requirements-ml.txt`, and submit from the project directory:
+
+```bash
+sbatch evaluate_reference.sbatch
+```
+
+The job uses the `lrd_all_serial` CPU partition, matching `device: cpu` in the
+CLIP configuration. It evaluates `.challenge-uploads` and writes its progress to
+`reference-evaluation-JOBID.log`. Scores, Excel, and the leaderboard are updated
+in the same data directory. The activated environment is inherited by the job;
+model files must be accessible on the compute node. No packages or models are
+downloaded by the job. If required by your allocation, add
+`--account=YOUR_SLURM_ACCOUNT` to the `sbatch` command.
+
+To evaluate a different API dataset or model configuration:
+
+```bash
+sbatch evaluate_reference.sbatch .challenge-other reference-evaluation.clip.json
+```
+
+### Evaluate accepted batches after teams upload
+
+Run the organizer evaluation command against the dataset that actually received
+the uploads. Stop its API process first so only one process owns the workbook:
+
+```bash
+python3 challenge/evaluate_reference.py --data .challenge-reference-v2 --evaluation-config reference-evaluation.clip.json
+```
+
+Module execution also works: `python3 -m challenge.evaluate_reference` with the
+same arguments. For uploads received by the CLIP-enabled server, change `--data`
+to `.challenge-reference-clip`. Use your Python 3.11+ environment with PyTorch
+and Transformers installed. No student token is needed for this local organizer
+command; it reads the private server database directly.
+
+The command defaults to `CHALLENGE_DATA` when set, otherwise `.challenge`, matching
+the FastAPI server. If uploads were received by the original API dataset without
+a configured reference task, provide the editing instruction explicitly:
+
+```bash
+python3 challenge/evaluate_reference.py --data .challenge --target-prompt "Change the blue backpack fabric to red, preserving the straps and background."
+```
+
+The script evaluates every accepted batch against its stored original image and
+the dataset's target prompt. CLIP similarity measures correspondence to the
+prompt; MSE, PSNR and SSIM measure correspondence to the original, with optional
+LPIPS and DINO metrics when configured. No mask or scikit-image is used.
+It updates the batch metrics in SQLite, refreshes `results.xlsx` in that dataset,
+and updates the reference leaderboard. Downloaded batches without an accepted
+edit are skipped. It recomputes all accepted batches on each run so results use
+the same evaluator; scores are committed together only after every evaluation
+succeeds. A failed evaluation leaves previous scores intact. If the API already
+configures learned evaluation, the supplied configuration must match it.
+
+This command can add offline CLIP results to `.challenge-reference-v2` without
+changing its frozen API configuration. Later uploads remain pending and are included when you run the organizer evaluation again. The API's
+reference leaderboard reads the updated scores after restart. Review the Excel
+**Reference uploads** sheet for all batch metrics and **Reference leaderboard**
+for each team's best result.
+
+### Use the supplied local CLIP checkpoint
+
+`reference-evaluation.clip.json` points to
+`/leonardo_scratch/fast/IscrC_SteFi/models/clip-vit-base-patch32` and records the
+SHA256 of its model weights. In your Python 3.11+ environment with the API and
+PyTorch/Transformers dependencies installed, create a separate dataset once:
+
+```bash
+python3 -m challenge.reference_demo --data .challenge-reference-clip --evaluation-config reference-evaluation.clip.json
+CHALLENGE_DATA=.challenge-reference-clip python3 -m uvicorn challenge.api:app --host 127.0.0.1 --port 8000
+```
+
+If that dataset already exists, run only the server command. Use its team token
+from `.challenge-reference-clip/config.json`, download a fresh batch into a new
+folder, and upload the edit using the existing student commands. CLIP similarity
+now enables ranking, while unavailable LPIPS and DINO metrics stay blank.
+No scikit-image package is required; SSIM uses NumPy integral-image window means.
+
+### Configure learned metrics when checkpoints are available
+
+Install `requirements-ml.txt` with appropriate CPU/CUDA wheels. In a **new**
+dataset, configure `reference_evaluation` before starting the server. The demo
+initializer accepts a JSON file via `--evaluation-config evaluation.json`:
+
+```json
+{
+  "clip_directory": "/absolute/path/to/local-clip",
+  "dinov2_directory": "/absolute/path/to/local-dinov2",
+  "lpips_checkpoint": "/absolute/path/to/lpips-alex-complete.pth",
+  "model_version": "frozen-clip-dino-lpips-revisions",
+  "device": "cpu"
+}
+```
+
+You can omit models that are not yet available; their metrics stay null. CLIP
+and DINOv2 must be complete Transformers-format checkpoints. LPIPS must contain
+both the ImageNet-trained AlexNet backbone and perceptually calibrated linear
+layers, not only the small calibration weights shipped with the package. On a
+machine where downloading pretrained weights is explicitly intended, prepare
+that complete checkpoint once:
+
+```python
+import lpips
+import torch
+
+torch.save(lpips.LPIPS(net="alex").state_dict(), "lpips-alex-complete.pth")
+```
+
+That preparation may download AlexNet weights. Server evaluation loads local
+weights only; it never downloads missing weights or substitutes random models.
+Keep checkpoint files and their recorded revisions fixed throughout the challenge.
+Changing evaluator configuration requires a new results dataset so scores remain
+comparable. CLIP text uses the checkpoint's token limit; long prompts are truncated.
+Pixel metrics, including windowed SSIM, use NumPy only. Learned metrics follow
+[LPIPS](https://github.com/richzhang/PerceptualSimilarity), and the existing CLIP/DINOv2 adapters.
 
 ## Give students access
 
@@ -76,7 +318,7 @@ curl --fail 'http://127.0.0.1:8000/api/reference/image' \
   -H "Authorization: Bearer $CHALLENGE_TOKEN" -o reference.png
 ```
 
-The timer controls new downloads and the dashboard preview; it cannot revoke saved copies. This sample is a viewing reference, not a scored task: it still needs editing instructions, a private reference mask, and an appropriate evaluation rubric before submissions can be scored against it. Existing scored tasks and temporary image uploads keep their own availability rules.
+The timer controls new downloads and the dashboard preview; it cannot revoke saved copies. The default sample provides pixel preservation metrics. The mask-free reference demo supplies an editing instruction; local learned checkpoints enable LPIPS, CLIP alignment, and DINO structure distance. Existing scored tasks and temporary image uploads keep their own availability rules.
 
 To retrieve the complete reference JSON during an open window:
 
@@ -120,7 +362,7 @@ print(result)
 
 Set `CHALLENGE_TOKEN` before running this code. The API accepts one edit per issued batch and rejects unknown batches, another team's batches, wrong dimensions, invalid images, and repeated uploads. Uploads can arrive after the download window closes. An issued batch establishes ownership and source identity; it cannot prove how a student generated an edit.
 
-Accepted edits persist in SQLite and appear in the **Reference uploads** worksheet in `results.xlsx`. The response is HTTP 201 with `status: accepted` and `scoring_status: unconfigured`. These uploads do not receive benchmark scores until the reference has editing instructions and evaluation annotations. The existing scored-task submission API remains separate.
+Accepted edits persist in SQLite and appear in the **Reference uploads** worksheet in `results.xlsx`. The response is HTTP 201 with `status: accepted`. The server saves the edit with `scoring_status: pending`. The separate evaluation script computes metrics and refreshes Excel and the reference leaderboard. No predicted mask is required. The existing scored-task submission API remains separate.
 
 ## Complete a student run
 
@@ -378,3 +620,16 @@ node --check static/app.js
 ```
 
 Tests cover perfect and unchanged edits, localization edges, context preservation, invalid uploads, ownership, private test annotations, persistence, frozen benchmark configuration, missing-task penalties, measured-vs-upload ranking, the HTTP workflow, and the inference contract. When optional ML dependencies are installed, tiny randomly initialized local CLIP and DINOv2 models test the real adapter APIs, patch layout, zero-direction policy, and background aggregation without downloading pretrained weights. These checks verify implementation contracts, not semantic metric quality.
+
+### Reference Excel layout
+
+For reference datasets, `results.xlsx` contains two sheets:
+
+- **Reference uploads**: Team ID, Batch ID, PSNR, LPIPS, MSE, SSIM, CLIP similarity, and structure distance.
+- **Team totals**: Team ID and the cumulative sum of each metric across that team's accepted batches.
+
+Metric names identify the score columns. Missing scores stay blank and do not
+contribute to sums; identical images produce `Infinity` for PSNR, including in
+totals. Metrics are summed separately because their scales and directions differ.
+Team totals do not change the API's best-batch leaderboard ranking. The workbook
+is regenerated on upload or evaluation, so reruns do not double-count batches.

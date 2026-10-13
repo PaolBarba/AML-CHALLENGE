@@ -1,0 +1,11 @@
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/leonardo/home/userexternal/pbarba00/AML-CHALLENGE/challenge/evaluate_reference.py", line 88, in <module>
+    main()
+  File "/leonardo/home/userexternal/pbarba00/AML-CHALLENGE/challenge/evaluate_reference.py", line 66, in main
+    store = Store(args.data, reference_only=True)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/leonardo/home/userexternal/pbarba00/AML-CHALLENGE/challenge/store.py", line 134, in __init__
+    self.db.executescript('''
+sqlite3.OperationalError: locking protocol

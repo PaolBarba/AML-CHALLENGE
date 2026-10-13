@@ -68,3 +68,22 @@ class RepresentationMetrics:
         if any(v is not None and not math.isfinite(v) for v in result.values()):
             raise ValueError('Representation evaluator produced a non-finite value')
         return result
+
+    def evaluate_reference(self, source, edited, prompt):
+        result = {}
+        torch = self.torch
+        if self.clip and prompt.strip():
+            images = self.clip_processor(images=[edited], return_tensors='pt').to(self.device)
+            texts = self.clip_processor(text=[prompt], padding=True, truncation=True,
+                                        max_length=self.clip.config.text_config.max_position_embeddings,
+                                        return_tensors='pt').to(self.device)
+            with torch.inference_mode():
+                image_features = self.clip.get_image_features(**images)
+                text_features = self.clip.get_text_features(**texts)
+            result['clip_similarity'] = self.cosine(image_features, text_features)
+        if self.dino:
+            a, _, _ = self.patches(source)
+            b, _, _ = self.patches(edited)
+            a, b = torch.nn.functional.normalize(a, dim=-1), torch.nn.functional.normalize(b, dim=-1)
+            result['structure_distance'] = float(((a @ a.T - b @ b.T) ** 2).mean().item())
+        return result

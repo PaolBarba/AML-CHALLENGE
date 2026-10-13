@@ -1,4 +1,6 @@
 -r requirements.txt
-# Optional diagnostics only; install in an environment with suitable CPU/CUDA wheels.
+# Optional learned evaluation metrics; install with suitable CPU/CUDA wheels.
 torch==2.9.0
 transformers==4.57.1
+torchvision==0.24.0
+lpips==0.1.4

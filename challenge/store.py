@@ -54,8 +54,12 @@ def decode_image(encoded, mode, size=None, formats=('PNG',)):
 
 
 class Store:
-    def __init__(self, root):
+    def __init__(self, root, reference_only=False):
         self.root = Path(root).resolve()
+        if not (self.root / 'config.json').is_file():
+            raise Invalid(f'Missing configuration: {self.root / "config.json"}. Restore the dataset or initialize a new directory with python -m challenge.reference_demo --data NEW_DIRECTORY, then set CHALLENGE_DATA to it.')
+        if reference_only and not (self.root / 'results.sqlite3').is_file():
+            raise Invalid('No existing API results database in this data directory')
         self.config = json.loads((self.root / 'config.json').read_text())
         self.tasks = {}
         weights = self.config.get('weights', {})
@@ -91,19 +95,21 @@ class Store:
                 if key in image_splits and image_splits[key] != task['split']:
                     raise Invalid('Source images cannot span dataset splits')
                 image_splits[key] = task['split']
-            source = self.load(task, 'source_image', 'RGB')
-            if source.width * source.height > Image.MAX_IMAGE_PIXELS:
-                raise Invalid('Source image exceeds pixel limit')
-            if task.get('metadata', {}).get('image_width') != source.width or task.get('metadata', {}).get('image_height') != source.height:
-                raise Invalid(f'Incorrect image metadata for {task_id}')
-            truth = self.load(task, 'ground_truth_mask', 'L')
-            allowed = self.load(task, 'allowed_edit_mask', 'L') if task.get('allowed_edit_mask') else truth
-            import numpy as np
-            g, a = np.asarray(truth), np.asarray(allowed)
-            if truth.size != source.size or allowed.size != source.size or not np.isin(g, [0, 255]).all() or not np.isin(a, [0, 255]).all():
-                raise Invalid('Reference masks must be binary and match source dimensions')
-            if not (g > 0).any() or not (a == 0).any() or ((g > 0) & (a == 0)).any():
-                raise Invalid('Masks require a target, a background, and an allowed region containing the target')
+            if not reference_only:
+                source = self.load(task, 'source_image', 'RGB')
+                if source.width * source.height > Image.MAX_IMAGE_PIXELS:
+                    raise Invalid('Source image exceeds pixel limit')
+                if task.get('metadata', {}).get('image_width') != source.width or task.get('metadata', {}).get('image_height') != source.height:
+                    raise Invalid(f'Incorrect image metadata for {task_id}')
+                if task_id != self.config.get('reference_task') or task.get('ground_truth_mask'):
+                    truth = self.load(task, 'ground_truth_mask', 'L')
+                    allowed = self.load(task, 'allowed_edit_mask', 'L') if task.get('allowed_edit_mask') else truth
+                    import numpy as np
+                    g, a = np.asarray(truth), np.asarray(allowed)
+                    if truth.size != source.size or allowed.size != source.size or not np.isin(g, [0, 255]).all() or not np.isin(a, [0, 255]).all():
+                        raise Invalid('Reference masks must be binary and match source dimensions')
+                    if not (g > 0).any() or not (a == 0).any() or ((g > 0) & (a == 0)).any():
+                        raise Invalid('Masks require a target, a background, and an allowed region containing the target')
             rubric = task.get('edit_rubric', {})
             if rubric.get('kind') == 'target_color':
                 rgb = rubric.get('rgb')
@@ -114,16 +120,20 @@ class Store:
             raise Invalid('Custom edit evaluators require an evaluator_version')
         if not self.tasks:
             raise Invalid('Dataset is empty')
+        self.reference_task = self.tasks.get(self.config.get('reference_task'))
+        if self.config.get('reference_task') and self.reference_task is None:
+            raise Invalid('Unknown configured reference_task')
         self.representations = None
-        if self.config.get('representation_metrics'):
+        if self.config.get('representation_metrics') and not reference_only:
             from .representations import RepresentationMetrics
             self.representations = RepresentationMetrics(self.config['representation_metrics'])
         self.evaluation_lock = threading.Lock()
         self.lock = threading.RLock()
         self.db = sqlite3.connect(self.root / 'results.sqlite3', check_same_thread=False)
         self.db.row_factory = sqlite3.Row
+        # Rollback journals support the shared filesystem used by Slurm jobs.
         self.db.executescript('''
-          PRAGMA journal_mode=WAL;
+          PRAGMA journal_mode=DELETE;
           CREATE TABLE IF NOT EXISTS reference_access (
             team TEXT PRIMARY KEY, started REAL NOT NULL);
           CREATE TABLE IF NOT EXISTS reference_batches (
@@ -150,20 +160,31 @@ class Store:
             team TEXT NOT NULL, split TEXT NOT NULL, run TEXT NOT NULL,
             PRIMARY KEY(team, split));
         ''')
-        fingerprint = hashlib.sha256()
-        benchmark_config = {k: self.config.get(k) for k in ('weights', 'reference_time_ms', 'hardware_profile', 'boundary_tolerance', 'dataset_version', 'edit_evaluator', 'evaluator_version', 'representation_metrics')}
-        fingerprint.update(json.dumps(benchmark_config, sort_keys=True).encode())
-        fingerprint.update(json.dumps(list(self.tasks.values()), sort_keys=True).encode())
-        for task in self.tasks.values():
-            for field in ('source_image', 'ground_truth_mask', 'allowed_edit_mask'):
-                if task.get(field):
-                    fingerprint.update(self.path(task[field]).read_bytes())
-        existing = self.db.execute('SELECT fingerprint FROM benchmark').fetchone()
-        if existing and existing[0] != fingerprint.hexdigest():
-            self.db.close()
-            raise Invalid('Benchmark changed; use a new data directory and results database')
-        if not existing:
-            self.db.execute('INSERT INTO benchmark VALUES(?)', (fingerprint.hexdigest(),))
+        columns = {row['name'] for row in self.db.execute('PRAGMA table_info(reference_batches)')}
+        for column in ('metrics', 'mask', 'source'):
+            if column not in columns:
+                self.db.execute(f'ALTER TABLE reference_batches ADD COLUMN {column} ' + ('TEXT' if column == 'metrics' else 'BLOB'))
+        if not reference_only:
+            fingerprint = hashlib.sha256()
+            benchmark_config = {k: self.config.get(k) for k in ('weights', 'reference_time_ms', 'hardware_profile', 'boundary_tolerance', 'dataset_version', 'edit_evaluator', 'evaluator_version', 'representation_metrics')}
+            if self.reference_task:
+                benchmark_config['reference_task'] = self.reference_task['task_id']
+            if self.config.get('reference_evaluation'):
+                from .reference_metrics import PROTOCOL
+                benchmark_config['reference_evaluation'] = self.config['reference_evaluation']
+                benchmark_config['reference_evaluation_protocol'] = PROTOCOL
+            fingerprint.update(json.dumps(benchmark_config, sort_keys=True).encode())
+            fingerprint.update(json.dumps(list(self.tasks.values()), sort_keys=True).encode())
+            for task in self.tasks.values():
+                for field in ('source_image', 'ground_truth_mask', 'allowed_edit_mask'):
+                    if task.get(field):
+                        fingerprint.update(self.path(task[field]).read_bytes())
+            existing = self.db.execute('SELECT fingerprint FROM benchmark').fetchone()
+            if existing and existing[0] != fingerprint.hexdigest():
+                self.db.close()
+                raise Invalid('Benchmark changed; use a new data directory and results database')
+            if not existing:
+                self.db.execute('INSERT INTO benchmark VALUES(?)', (fingerprint.hexdigest(),))
         self.db.commit()
         self.refresh_excel()
 
@@ -228,8 +249,8 @@ class Store:
             if count >= self.config.get('max_team_submissions', 1000):
                 raise Invalid('Reference batch limit reached')
             batch_id = uuid.uuid4().hex
-            self.db.execute('INSERT INTO reference_batches (id,team,window_end,source_hash,width,height,created) VALUES(?,?,?,?,?,?,?)',
-                            (batch_id, team, window_end, digest, width, height, time.time()))
+            self.db.execute('INSERT INTO reference_batches (id,team,window_end,source_hash,width,height,created,source) VALUES(?,?,?,?,?,?,?,?)',
+                            (batch_id, team, window_end, digest, width, height, time.time(), raw))
         return batch_id
 
     def submit_reference(self, payload, team, admin=False):
@@ -241,15 +262,41 @@ class Store:
         with self.lock:
             batch = self.db.execute('SELECT * FROM reference_batches WHERE id=? AND team=?', (batch_id, team)).fetchone()
         if batch is None:
-            raise PermissionError('Batch was not issued to this team')
-        edited = image_bytes(decode_image(payload.get('edited_image'), 'RGB', (batch['width'], batch['height'])))
+            raise PermissionError('Batch was not issued to this team in this dataset. Download a fresh reference from this API using the same team token, then upload with its reference.json.')
+        edited_image = decode_image(payload.get('edited_image'), 'RGB', (batch['width'], batch['height']))
         with self.lock, self.db:
-            cursor = self.db.execute('UPDATE reference_batches SET received=?, edited=? WHERE id=? AND received IS NULL',
-                                     (time.time(), edited, batch_id))
+            cursor = self.db.execute('UPDATE reference_batches SET received=?, edited=?, metrics=? WHERE id=? AND received IS NULL',
+                                     (time.time(), image_bytes(edited_image), None, batch_id))
             if cursor.rowcount != 1:
                 raise Invalid('An edit was already accepted for this batch')
         return dict(status='accepted', batch_id=batch_id, reference_id='backpack_reference',
-                    scoring_status='unconfigured', excel_updated=self.refresh_excel())
+                    scoring_status='pending',
+                    metrics=None, excel_updated=self.refresh_excel())
+
+    def reference_image_path(self):
+        if self.reference_task:
+            return self.path(self.reference_task['source_image'])
+        return Path(__file__).resolve().parent.parent / 'data' / 'image.png'
+
+    def reference_instructions(self):
+        if not self.reference_task:
+            return {}
+        return {key: self.reference_task[key] for key in ('task_id', 'source_prompt', 'target_prompt')}
+
+    def reference_leaderboard(self):
+        from .reference_metrics import PROTOCOL, ranking_key
+        with self.lock:
+            rows = self.db.execute('SELECT id,team,received,metrics FROM reference_batches WHERE metrics IS NOT NULL').fetchall()
+        best = {}
+        for row in rows:
+            metrics = json.loads(row['metrics'])
+            if metrics.get('evaluation_protocol') != PROTOCOL or metrics.get('clip_similarity') is None:
+                continue
+            item = dict(team=row['team'], batch_id=row['id'], received=row['received'], metrics=metrics, score=metrics['score'])
+            previous = best.get(row['team'])
+            if previous is None or (ranking_key(item['metrics']), item['received'], item['batch_id']) < (ranking_key(previous['metrics']), previous['received'], previous['batch_id']):
+                best[row['team']] = item
+        return sorted(best.values(), key=lambda item: (ranking_key(item['metrics']), item['received'], item['team']))
 
     def authenticate(self, token):
         if hmac.compare_digest(token, self.config['admin_token']):
@@ -300,7 +347,7 @@ class Store:
     def public_task(self, task):
         return {key: task[key] for key in ('task_id', 'image_id', 'source_prompt', 'target_prompt', 'task_type', 'difficulty', 'split', 'metadata')} | {
             'image_url': f'/api/tasks/{task["task_id"]}/image',
-            **({'mask_url': f'/api/tasks/{task["task_id"]}/mask'} if task['split'] != 'test' else {})}
+            **({'mask_url': f'/api/tasks/{task["task_id"]}/mask'} if task['split'] != 'test' and task is not self.reference_task else {})}
 
     def submit(self, payload, team, admin=False, measured=False):
         if not isinstance(payload, dict):
@@ -314,6 +361,8 @@ class Store:
         task = self.tasks.get(payload.get('task_id'))
         if task is None:
             raise Invalid('Unknown task')
+        if task is self.reference_task:
+            raise Invalid('Submit reference edits through /api/reference/submissions')
         metadata = payload.get('metadata', {})
         if not isinstance(metadata, dict) or len(json.dumps(metadata)) > 16_384:
             raise Invalid('Metadata must be an object of at most 16 KB')
